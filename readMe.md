@@ -1,5 +1,282 @@
 # Outlook Bulk Responder
 
+Two PowerShell scripts for bulk-replying to mailbox messages. Choose based on your environment:
+
+| Script | Target environment | Authentication |
+|--------|--------------------|----------------|
+| [`Invoke-GraphBulkResponder.ps1`](#invoke-graphbulkresponderps1--microsoft-365--graph-api) | Microsoft 365 / Exchange Online | OAuth 2.0 device code — browser sign-in, no DLL |
+| [`Invoke-OutlookBulkResponder.ps1`](#invoke-outlookbulkresponderps1--on-premises-exchange--ews) | On-premises Exchange | EWS Managed API DLL + credentials |
+
+Both scripts share the same batch-send, CSV tracker, log file, and `-ResumeFromCSV` workflow. The CSV files from one script are **not** interchangeable with the other.
+
+---
+
+## `Invoke-GraphBulkResponder.ps1` — Microsoft 365 / Graph API
+
+Connects to a Microsoft 365 mailbox using the **Microsoft Graph API** and **OAuth 2.0 device code flow**. No EWS DLL is required — all HTTP calls use PowerShell's built-in `Invoke-RestMethod`. The script prints a short code and a URL; the user opens the URL in any browser, enters the code, and signs in to their Microsoft 365 account.
+
+### Required Files (Graph)
+
+| File | Purpose |
+|------|---------|
+| `Invoke-GraphBulkResponder.ps1` | The script |
+
+No external DLLs. Requires PowerShell 5.1+ and outbound HTTPS access to `login.microsoftonline.com` and `graph.microsoft.com`.
+
+---
+
+### Azure AD App Registration
+
+The script requires an Azure AD app registration with delegated Mail permissions and device code flow enabled. Follow these steps once per tenant.
+
+#### Step 1 — Create the app registration
+
+1. Sign in to the [Azure Portal](https://portal.azure.com) as a Global Administrator or Application Administrator.
+2. Go to **Azure Active Directory** → **App registrations** → **New registration**.
+3. Fill in the form:
+   - **Name**: `Outlook Bulk Responder` (or any name you prefer)
+   - **Supported account types**: *Accounts in this organizational directory only* (single-tenant) — use *any Azure AD directory* only if you need multi-tenant access
+   - **Redirect URI**: leave blank (device code flow does not use a redirect URI)
+4. Click **Register**.
+
+#### Step 2 — Enable public client / device code flow
+
+1. In the app registration, go to **Authentication**.
+2. Under **Advanced settings**, set **Allow public client flows** to **Yes**.
+3. Click **Save**.
+
+#### Step 3 — Grant API permissions
+
+1. In the app registration, go to **API permissions** → **Add a permission** → **Microsoft Graph** → **Delegated permissions**.
+2. Search for and add:
+   - `Mail.Read`
+   - `Mail.Send`
+3. If your tenant requires admin consent for delegated permissions, click **Grant admin consent for [your tenant]** and confirm.
+
+#### Step 4 — Collect your IDs
+
+From the app registration **Overview** page, copy:
+
+| Value | Where to find it | Script parameter |
+|-------|-----------------|-----------------|
+| **Tenant ID** | Azure Active Directory → Overview → *Tenant ID* | `-TenantId` |
+| **Client ID** | App registrations → your app → *Application (client) ID* | `-ClientId` |
+
+---
+
+### Authentication Flow (device code)
+
+When the script starts it contacts `login.microsoftonline.com` and prints:
+
+```
+==============================================================
+ AUTHENTICATION REQUIRED
+==============================================================
+
+  1. Open a browser and navigate to:
+     https://microsoft.com/devicelogin
+
+  2. Enter this code when prompted:
+     WDJB-MJHT
+
+  Waiting for sign-in (expires in 900s) ...
+==============================================================
+```
+
+Open the URL in any browser (on any device), enter the code, and sign in with the account that has access to the target mailbox. The script polls silently and continues automatically once sign-in is complete.
+
+The script acquires a **refresh token** alongside the access token and uses it to silently renew the access token during long batch runs, so you will not be prompted again mid-session unless the refresh token itself expires (typically 90 days for most tenants).
+
+---
+
+### Parameters (Graph)
+
+#### Authentication
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `-TenantId` | String | Azure AD tenant ID (GUID) or `common`. Prompted if omitted. |
+| `-ClientId` | String | App registration client ID (GUID). Prompted if omitted. |
+| `-MailboxEmail` | String | SMTP address of the mailbox to access. The signed-in account must have access to this mailbox. Prompted if omitted. |
+
+#### New-search parameters *(required unless `-ResumeFromCSV` is used)*
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `-FolderPath` | String | Folder to search. Well-known names: `Inbox`, `Drafts`, `Sent Items`, `Deleted Items`, `Junk Email`, `Archive`. Use `\` for subfolders. |
+| `-Subject` | String | Substring to match against message subjects (case-insensitive). |
+| `-StartDate` | DateTime | Inclusive start of the received-date range. |
+| `-EndDate` | DateTime | Inclusive end of the received-date range (covers through midnight UTC). |
+
+#### Reply body *(one or neither — prompted interactively if both omitted)*
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `-ReplyBody` | String | Plain-text reply body on the command line. |
+| `-ReplyHtmlFile` | String | Path to an HTML file to use as the reply body. |
+
+#### Behaviour
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `-EstimateOnly` | Switch | Show match count only. No reply sent, no CSV created. Also works with `-ResumeFromCSV`. |
+| `-ReplyAll` | Switch | Use Reply All instead of Reply. |
+| `-BatchSize` | Int | Replies per batch. `0` (default) prompts interactively; enter `0` at the prompt to send all at once. |
+| `-ResumeFromCSV` | String | Path to a tracker CSV from a prior run. Skips rows where `ResponseSubmitted = True`. |
+| `-USGovDoD` | Switch | Route all traffic to the Microsoft 365 GCC High / DoD sovereign cloud. See [USGovDoD endpoints](#usgov-dod-sovereign-cloud) below. |
+
+---
+
+### Example Usages (Graph)
+
+#### Estimate match count
+
+```powershell
+.\Invoke-GraphBulkResponder.ps1 `
+    -TenantId     "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+    -ClientId     "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" `
+    -MailboxEmail "you@contoso.com" `
+    -FolderPath   "Inbox" `
+    -Subject      "Project Alpha Status" `
+    -StartDate    "2024-03-01" `
+    -EndDate      "2024-03-31" `
+    -EstimateOnly
+```
+
+#### Send plain-text replies in batches of 10
+
+```powershell
+.\Invoke-GraphBulkResponder.ps1 `
+    -TenantId     "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+    -ClientId     "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" `
+    -MailboxEmail "support@contoso.com" `
+    -FolderPath   "Inbox\Client Requests" `
+    -Subject      "Support Ticket" `
+    -StartDate    "2024-04-01" `
+    -EndDate      "2024-04-30" `
+    -BatchSize    10
+```
+
+After authentication, the script displays matched messages, prompts for the reply body (type `END` to finish), and asks for confirmation before each batch.
+
+#### Send HTML replies from a file, Reply All
+
+```powershell
+.\Invoke-GraphBulkResponder.ps1 `
+    -TenantId      "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+    -ClientId      "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" `
+    -MailboxEmail  "billing@contoso.com" `
+    -FolderPath    "Inbox" `
+    -Subject       "Invoice" `
+    -StartDate     "2024-01-01" `
+    -EndDate       "2024-01-31" `
+    -ReplyHtmlFile ".\auto-reply.html" `
+    -ReplyAll `
+    -BatchSize     25
+```
+
+#### Resume a paused session
+
+```powershell
+.\Invoke-GraphBulkResponder.ps1 `
+    -TenantId      "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+    -ClientId      "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" `
+    -MailboxEmail  "you@contoso.com" `
+    -ResumeFromCSV ".\bulk-responder-202403151030.csv" `
+    -ReplyHtmlFile ".\auto-reply.html" `
+    -BatchSize     10
+```
+
+#### Estimate pending count from a saved CSV
+
+```powershell
+.\Invoke-GraphBulkResponder.ps1 `
+    -TenantId      "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+    -ClientId      "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" `
+    -MailboxEmail  "you@contoso.com" `
+    -ResumeFromCSV ".\bulk-responder-202403151030.csv" `
+    -EstimateOnly
+```
+
+---
+
+### USGov DoD Sovereign Cloud
+
+Add `-USGovDoD` to any invocation to route all authentication and API traffic away from the commercial cloud endpoints and to the DoD sovereign cloud endpoints:
+
+| Endpoint | Commercial | USGovDoD |
+|----------|-----------|---------|
+| Login / token | `login.microsoftonline.com` | `login.microsoftonline.us` |
+| Graph API | `graph.microsoft.com/v1.0` | `dod-graph.microsoft.us/v1.0` |
+| OAuth scope resource | `https://graph.microsoft.com` | `https://dod-graph.microsoft.us` |
+
+#### Prerequisites for DoD
+
+- The app registration must be created in the **GCC High / DoD Azure AD tenant** (portal: `portal.azure.us`), not the commercial portal.
+- The target mailbox must be hosted in the same DoD tenant.
+- The app registration steps are identical to the commercial steps above, performed at `portal.azure.us` instead of `portal.azure.com`.
+- The device code sign-in URL displayed by the script (`https://microsoft.com/devicelogin`) is the same for both clouds; the token endpoint (`login.microsoftonline.us`) is what changes.
+
+#### Example — DoD bulk reply in batches of 20
+
+```powershell
+.\Invoke-GraphBulkResponder.ps1 `
+    -TenantId     "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+    -ClientId     "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" `
+    -MailboxEmail "you@mail.mil" `
+    -FolderPath   "Inbox" `
+    -Subject      "TASKORD" `
+    -StartDate    "2024-06-01" `
+    -EndDate      "2024-06-30" `
+    -ReplyHtmlFile ".\reply.html" `
+    -BatchSize    20 `
+    -USGovDoD
+```
+
+#### Example — DoD estimate only
+
+```powershell
+.\Invoke-GraphBulkResponder.ps1 `
+    -TenantId     "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+    -ClientId     "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" `
+    -MailboxEmail "you@mail.mil" `
+    -FolderPath   "Inbox" `
+    -Subject      "TASKORD" `
+    -StartDate    "2024-06-01" `
+    -EndDate      "2024-06-30" `
+    -EstimateOnly `
+    -USGovDoD
+```
+
+#### Example — DoD resume from a saved CSV
+
+```powershell
+.\Invoke-GraphBulkResponder.ps1 `
+    -TenantId      "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+    -ClientId      "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" `
+    -MailboxEmail  "you@mail.mil" `
+    -ResumeFromCSV ".\bulk-responder-202406011430.csv" `
+    -ReplyHtmlFile ".\reply.html" `
+    -BatchSize     20 `
+    -USGovDoD
+```
+
+When the user exits mid-batch, the resume command printed to the console automatically includes `-USGovDoD` so the correct endpoints are used on the next run.
+
+---
+
+### Notes (Graph)
+
+- **Body quoting** — The script sets `message.body` on the reply, which replaces the full body. The original quoted message is not automatically appended. To include quoted content, add it manually to your HTML file.
+- **Graph throttling** — The Graph API enforces per-user and per-app rate limits. If you encounter `429 Too Many Requests` errors, reduce `-BatchSize` and add pauses between batches.
+- **Admin consent** — Some tenants enforce admin consent for all delegated permissions. If the device code sign-in fails with a consent error, have a Global Administrator grant consent via the Azure Portal step above.
+- **Shared / delegated mailboxes** — The signed-in account must have `Full Access` (or at minimum `Send As`) permission on the target mailbox in Exchange Online for the reply to succeed.
+- **Log entries** — All log lines from this script are tagged `[GRAPH]` so they are distinguishable from EWS script entries in the shared `bulk-responder.log`.
+
+---
+
+## `Invoke-OutlookBulkResponder.ps1` — On-premises Exchange (EWS)
+
 A PowerShell script that connects to an Exchange mailbox via the **EWS Managed API**, searches a specified folder for email messages matching a subject string and date range, and sends replies in configurable batches. A persistent log file records every run and every sent reply. A per-run CSV tracker file records the status of every matched message and can be used to resume a session that was paused or interrupted.
 
 ---
