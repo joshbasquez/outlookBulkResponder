@@ -1,13 +1,228 @@
 # Outlook Bulk Responder
 
-Two PowerShell scripts for bulk-replying to mailbox messages. Choose based on your environment:
+Three PowerShell scripts for bulk-replying to mailbox messages. Choose based on your environment:
 
-| Script | Target environment | Authentication |
-|--------|--------------------|----------------|
-| [`Invoke-GraphBulkResponder.ps1`](#invoke-graphbulkresponderps1--microsoft-365--graph-api) | Microsoft 365 / Exchange Online | OAuth 2.0 device code — browser sign-in, no DLL |
-| [`Invoke-OutlookBulkResponder.ps1`](#invoke-outlookbulkresponderps1--on-premises-exchange--ews) | On-premises Exchange | EWS Managed API DLL + credentials |
+| Script | Target environment | Authentication | Requirements |
+|--------|--------------------|----------------|--------------|
+| [`Invoke-PSGraphBulkResponder.ps1`](#invoke-psgraphbulkresponderps1--microsoft-365--graph-powershell-module) | Microsoft 365 / Exchange Online | WAM popup window — no custom app registration | `Microsoft.Graph.Authentication` module |
+| [`Invoke-GraphBulkResponder.ps1`](#invoke-graphbulkresponderps1--microsoft-365--graph-api) | Microsoft 365 / Exchange Online | OAuth 2.0 device code — browser sign-in, no DLL | Custom Azure AD app registration |
+| [`Invoke-OutlookBulkResponder.ps1`](#invoke-outlookbulkresponderps1--on-premises-exchange--ews) | On-premises Exchange | Windows credentials (NTLM/Kerberos) or basic auth | EWS Managed API DLL |
 
-Both scripts share the same batch-send, CSV tracker, log file, and `-ResumeFromCSV` workflow. The CSV files from one script are **not** interchangeable with the other.
+All three scripts share the same batch-send, CSV tracker, log file, and `-ResumeFromCSV` workflow. The CSV files from one script are **not** interchangeable with the others.
+
+---
+
+## `Invoke-PSGraphBulkResponder.ps1` — Microsoft 365 / Graph PowerShell Module
+
+Connects to a Microsoft 365 mailbox using the **Microsoft Graph PowerShell module** (`Connect-MgGraph` / `Invoke-MgGraphRequest`). No custom Azure AD app registration is required — the script uses the built-in **Microsoft Graph Command Line Tools** enterprise application that is pre-authorized in every M365 tenant.
+
+On Windows, `Connect-MgGraph` opens a **WAM (Windows Web Account Manager) popup sign-in window**. On macOS and Linux it launches a browser tab. On first use the signed-in user is asked to consent to `Mail.Read` and `Mail.Send` delegated permissions; subsequent runs reuse the cached session automatically.
+
+This is the recommended starting point for **M365 users who do not have Global Administrator access** or who cannot create custom app registrations.
+
+---
+
+### Required Module
+
+| Module | Purpose |
+|--------|---------|
+| `Microsoft.Graph.Authentication` | Provides `Connect-MgGraph` and `Invoke-MgGraphRequest` |
+
+Install from the PowerShell Gallery (one-time, per machine):
+
+```powershell
+# Minimum — only what the script needs
+Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
+
+# Or install the full SDK (includes all Graph cmdlets)
+Install-Module Microsoft.Graph -Scope CurrentUser
+```
+
+Requires PowerShell 5.1+ and outbound HTTPS access to `login.microsoftonline.com` and `graph.microsoft.com` (or the DoD equivalents when `-USGovDoD` is used).
+
+---
+
+### Authentication Flow
+
+When the script starts it calls `Connect-MgGraph -Scopes "Mail.Read","Mail.Send"`. On Windows a sign-in dialog opens immediately:
+
+```
+Signing in to Microsoft Graph ...
+  A sign-in window will appear. Sign in with the account that has access to the target mailbox.
+```
+
+Sign in with the account that owns (or has delegated access to) the target mailbox. On first use a consent screen lists the two requested permissions; click **Accept**. The module caches the session token — you will not be prompted again on subsequent runs from the same machine until the token expires.
+
+On macOS/Linux the module launches the default browser instead of a popup.
+
+---
+
+### Parameters (PSGraph)
+
+#### Identity
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `-MailboxEmail` | String | SMTP address of the mailbox to access. The signed-in account must be this user or have delegated access. Prompted if omitted. |
+| `-TenantId` | String | Optional. Azure AD tenant ID or domain name, passed to `Connect-MgGraph` to select the correct tenant when the account belongs to multiple tenants. |
+
+#### New-search parameters *(required unless `-ResumeFromCSV` is used)*
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `-FolderPath` | String | Folder to search. Well-known names: `Inbox`, `Drafts`, `Sent Items`, `Deleted Items`, `Junk Email`, `Archive`. Use `\` for subfolders. |
+| `-Subject` | String | Substring to match against message subjects (case-insensitive). |
+| `-StartDate` | DateTime | Inclusive start of the received-date range. |
+| `-EndDate` | DateTime | Inclusive end of the received-date range (covers through midnight UTC). |
+
+#### Reply body *(one or neither — prompted interactively if both omitted)*
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `-ReplyBody` | String | Plain-text reply body on the command line. |
+| `-ReplyHtmlFile` | String | Path to an HTML file to use as the reply body. |
+
+#### Behaviour
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `-EstimateOnly` | Switch | Show match count only. No reply sent, no CSV created. Also works with `-ResumeFromCSV`. |
+| `-ReplyAll` | Switch | Use Reply All instead of Reply. |
+| `-BatchSize` | Int | Replies per batch. `0` (default) prompts interactively; enter `0` at the prompt to send all at once. |
+| `-ResumeFromCSV` | String | Path to a tracker CSV from a prior run. Skips rows where `ResponseSubmitted = True`. |
+| `-USGovDoD` | Switch | Pass `-Environment USGovDoD` to `Connect-MgGraph`, routing all traffic to the DoD sovereign cloud. See [USGovDoD notes](#usgov-dod-notes-psgraph) below. |
+
+---
+
+### Example Usages (PSGraph)
+
+#### Estimate match count (WAM popup appears to sign in)
+
+```powershell
+.\Invoke-PSGraphBulkResponder.ps1 `
+    -MailboxEmail "you@contoso.com" `
+    -FolderPath   "Inbox" `
+    -Subject      "Project Alpha Status" `
+    -StartDate    "2024-03-01" `
+    -EndDate      "2024-03-31" `
+    -EstimateOnly
+```
+
+#### Send plain-text replies in batches of 10
+
+```powershell
+.\Invoke-PSGraphBulkResponder.ps1 `
+    -MailboxEmail "support@contoso.com" `
+    -FolderPath   "Inbox\Client Requests" `
+    -Subject      "Support Ticket" `
+    -StartDate    "2024-04-01" `
+    -EndDate      "2024-04-30" `
+    -BatchSize    10
+```
+
+After sign-in, the script displays matched messages, prompts for the reply body (type `END` to finish), and asks for confirmation before each batch.
+
+#### Send HTML replies from a file, Reply All
+
+```powershell
+.\Invoke-PSGraphBulkResponder.ps1 `
+    -MailboxEmail  "billing@contoso.com" `
+    -FolderPath    "Inbox" `
+    -Subject       "Invoice" `
+    -StartDate     "2024-01-01" `
+    -EndDate       "2024-01-31" `
+    -ReplyHtmlFile ".\auto-reply.html" `
+    -ReplyAll `
+    -BatchSize     25
+```
+
+#### Resume a paused session
+
+```powershell
+.\Invoke-PSGraphBulkResponder.ps1 `
+    -MailboxEmail  "you@contoso.com" `
+    -ResumeFromCSV ".\bulk-responder-202403151030.csv" `
+    -ReplyHtmlFile ".\auto-reply.html" `
+    -BatchSize     10
+```
+
+#### Estimate pending count from a saved CSV
+
+```powershell
+.\Invoke-PSGraphBulkResponder.ps1 `
+    -MailboxEmail  "you@contoso.com" `
+    -ResumeFromCSV ".\bulk-responder-202403151030.csv" `
+    -EstimateOnly
+```
+
+---
+
+### USGov DoD Notes (PSGraph)
+
+Add `-USGovDoD` to pass `-Environment USGovDoD` to `Connect-MgGraph`. The module automatically routes all API traffic to the DoD sovereign cloud endpoints:
+
+| Endpoint | Commercial | USGovDoD |
+|----------|-----------|---------|
+| Login / token | `login.microsoftonline.com` | `login.microsoftonline.us` |
+| Graph API | `graph.microsoft.com/v1.0` | `dod-graph.microsoft.us/v1.0` |
+
+No changes to the sign-in experience — a WAM popup (or browser tab) still appears, but it targets the DoD identity infrastructure.
+
+#### Prerequisites for DoD (PSGraph)
+
+- The signed-in account must exist in the **GCC High / DoD Azure AD tenant**.
+- The target mailbox must be hosted in the same DoD tenant.
+- The Microsoft Graph Command Line Tools enterprise app (`14d82eec-204b-4c2f-b7e8-296a70dab67e`) must be present in the DoD tenant. It is provisioned automatically on first sign-in for most DoD tenants, but some organizations restrict this — check with your tenant administrator if the sign-in fails with a consent error.
+
+#### Example — DoD bulk reply in batches of 20
+
+```powershell
+.\Invoke-PSGraphBulkResponder.ps1 `
+    -MailboxEmail  "you@mail.mil" `
+    -FolderPath    "Inbox" `
+    -Subject       "TASKORD" `
+    -StartDate     "2024-06-01" `
+    -EndDate       "2024-06-30" `
+    -ReplyHtmlFile ".\reply.html" `
+    -BatchSize     20 `
+    -USGovDoD
+```
+
+#### Example — DoD estimate only
+
+```powershell
+.\Invoke-PSGraphBulkResponder.ps1 `
+    -MailboxEmail "you@mail.mil" `
+    -FolderPath   "Inbox" `
+    -Subject      "TASKORD" `
+    -StartDate    "2024-06-01" `
+    -EndDate      "2024-06-30" `
+    -EstimateOnly `
+    -USGovDoD
+```
+
+#### Example — DoD resume from a saved CSV
+
+```powershell
+.\Invoke-PSGraphBulkResponder.ps1 `
+    -MailboxEmail  "you@mail.mil" `
+    -ResumeFromCSV ".\bulk-responder-202406011430.csv" `
+    -ReplyHtmlFile ".\reply.html" `
+    -BatchSize     20 `
+    -USGovDoD
+```
+
+When the user exits mid-batch, the resume command printed to the console automatically includes `-USGovDoD` so the correct environment is used on the next run.
+
+---
+
+### Notes (PSGraph)
+
+- **Module version** — The `Microsoft.Graph.Authentication` module version 2.x or later is recommended. Version 1.x is supported but may have minor differences in `Invoke-MgGraphRequest` output formatting.
+- **Consent** — On first use each account must consent to `Mail.Read` and `Mail.Send`. Some tenants require an administrator to pre-approve these scopes for the Microsoft Graph Command Line Tools app. If sign-in fails with a consent error, ask a Global Administrator to grant tenant-wide admin consent for the app in **Azure Active Directory → Enterprise applications → Microsoft Graph Command Line Tools → Permissions**.
+- **Shared / delegated mailboxes** — The signed-in account must have `Full Access` (or at minimum `Send As`) permission on the target mailbox in Exchange Online.
+- **Body quoting** — The script sets `message.body` on the reply, which replaces the full body. The original quoted message is not automatically appended. Include quoted content manually in your HTML file if needed.
+- **Log entries** — All log lines from this script are tagged `[PSGRAPH]` so they are distinguishable from `[GRAPH]` and EWS entries in the shared `bulk-responder.log`.
 
 ---
 
@@ -610,10 +825,9 @@ After choosing to exit mid-batch, the script prints the exact resume command. Co
 ```
 
 On resume the script:
-1. Loads the CSV and counts how many messages still have `ResponseSentSuccessfully = False`.
+1. Loads the CSV and counts how many messages still have `ResponseSubmitted = False`.
 2. Displays the pending-messages table.
 3. Prompts for confirmation and proceeds with batching exactly as in a new run.
-4. Retries any message where `ResponseSubmitted = True` but `ResponseSentSuccessfully = False` (send was attempted but failed).
 
 ### Estimate pending count from a saved CSV
 
